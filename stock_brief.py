@@ -1,68 +1,61 @@
 """
-STOCK NEWS BRIEF - your mini Bloomberg terminal (v0.1)
+STOCK NEWS BRIEF - your mini Bloomberg terminal (v0.2)
 ------------------------------------------------------
 What this does:
   1. Asks you for a stock ticker (like AAPL or TSLA)
   2. Fetches recent news headlines about that company from Finnhub
-  3. Sends those headlines to Claude, which writes a short investor brief
-  4. Prints the brief in your terminal
+  3. Sends them to Claude, which returns structured JSON (sentiment score etc.)
+  4. Prints a formatted brief in your terminal
 
-How to run it (after setup):
-  python stock_brief.py
+How to run it:
+  python3 stock_brief.py
 """
 
 # ---------- IMPORTS ----------
-# "import" pulls in code other people wrote so we don't reinvent the wheel.
-
-import os                      # lets us read environment variables (where we hide API keys)
-import requests                # lets us make requests to websites/APIs over the internet
-from datetime import date, timedelta   # for working with dates (news from the last week)
-from dotenv import load_dotenv          # loads our secret keys from the .env file
+import os                      # read environment variables (where we hide API keys)
+import json                    # convert JSON text <-> Python dictionaries
+import requests                # make requests to APIs over the internet
+from datetime import date, timedelta   # work with dates (news from the last week)
+from dotenv import load_dotenv          # load our secret keys from the .env file
 from anthropic import Anthropic         # the official Claude library
 
 # ---------- SETUP ----------
-# This reads the file called ".env" in the same folder and loads the keys inside it.
 load_dotenv()
 
-FINNHUB_KEY = os.getenv("FINNHUB_API_KEY")      # your Finnhub key from the .env file
-claude = Anthropic()  # the Anthropic library automatically finds ANTHROPIC_API_KEY in .env
+FINNHUB_KEY = os.getenv("FINNHUB_API_KEY")
+claude = Anthropic()  # automatically finds ANTHROPIC_API_KEY in .env
 
 
 # ---------- STEP 1: GET NEWS HEADLINES ----------
 def get_news(ticker):
     """
     Asks Finnhub for company news from the last 7 days.
-    Returns a list of news items (each one is a dictionary with title, summary, etc.)
+    Returns a list of news items (each is a dictionary with title, summary, etc.)
     """
     today = date.today()
     week_ago = today - timedelta(days=7)
 
-    # This is the web address (API endpoint) we're requesting data from.
     url = "https://finnhub.io/api/v1/company-news"
 
-    # These are the "parameters" - extra info the API needs from us.
     params = {
-        "symbol": ticker,                        # which stock
-        "from": week_ago.strftime("%Y-%m-%d"),   # start date, formatted like 2026-06-29
-        "to": today.strftime("%Y-%m-%d"),        # end date
-        "token": FINNHUB_KEY,                    # proves we're allowed to use the API
+        "symbol": ticker,
+        "from": week_ago.strftime("%Y-%m-%d"),
+        "to": today.strftime("%Y-%m-%d"),
+        "token": FINNHUB_KEY,
     }
 
-    response = requests.get(url, params=params)  # actually make the request
+    response = requests.get(url, params=params)
+    response.raise_for_status()   # stop with an error if something went wrong
 
-    # If something went wrong (bad key, no internet), stop and show the error.
-    response.raise_for_status()
-
-    news_items = response.json()   # convert the response into Python data (a list)
-
-    # Keep only the first 10 stories so we don't overwhelm Claude (or your wallet).
-    return news_items[:10]
+    news_items = response.json()
+    return news_items[:10]        # keep only the first 10 stories
 
 
-# ---------- STEP 2: SUMMARIZE WITH CLAUDE ----------
+# ---------- STEP 2: SUMMARIZE WITH CLAUDE (structured JSON output) ----------
 def summarize(ticker, news_items):
     """
-    Sends the headlines to Claude and asks for a short investor brief.
+    Sends the headlines to Claude and gets back structured data:
+    a dictionary with sentiment_score, summary, top_risk, etc.
     """
     # Build one big text block out of all the headlines + summaries.
     headlines_text = ""
@@ -71,36 +64,43 @@ def summarize(ticker, news_items):
         headlines_text += f"  SOURCE: {item['source']}\n"
         headlines_text += f"  SUMMARY: {item['summary']}\n\n"
 
-    # The "prompt" - our instructions to Claude. Prompt design is a real skill;
-    # notice we tell it exactly what format and length we want.
+    # The prompt now demands JSON. The doubled {{ }} are how you write a
+    # literal curly brace inside an f-string.
     prompt = f"""You are a financial news analyst. Below are recent news items
 about the stock {ticker}.
 
 {headlines_text}
 
-Write a brief for an investor with exactly these three sections:
-1. SUMMARY: 3-4 sentences covering the most important developments.
-2. TONE: One word (Positive / Negative / Mixed) plus one sentence explaining why.
-3. WATCH OUT: One sentence flagging anything that looks like rumor or is only
-   reported by a single source, or say "Nothing notable" if all looks solid.
+Respond with ONLY a JSON object, no other text before or after, in exactly
+this format:
+{{
+  "sentiment_score": <integer 1-10, where 1=very negative, 10=very positive>,
+  "sentiment_label": "<Positive, Negative, or Mixed>",
+  "summary": "<3-4 sentence summary of the most important developments>",
+  "top_risk": "<the single biggest risk or concern in this news>",
+  "rumor_flag": <true if any major story is single-source or unconfirmed, else false>
+}}
 
-Be concise and factual. Do not give buy/sell advice."""
+Be factual. Do not give buy/sell advice."""
 
-    # This is the actual call to Claude.
     message = claude.messages.create(
-        model="claude-sonnet-4-6",   # which Claude model to use
-        max_tokens=500,               # cap on response length (keeps costs tiny)
+        model="claude-sonnet-4-6",
+        max_tokens=500,
         messages=[{"role": "user", "content": prompt}],
     )
 
-    # Claude's reply comes back as a list of blocks; we want the text of the first one.
-    return message.content[0].text
+    raw = message.content[0].text
+
+    # Sometimes the model wraps JSON in ```json fences - strip them if present.
+    raw = raw.replace("```json", "").replace("```", "").strip()
+
+    return json.loads(raw)   # convert the JSON text into a Python dictionary
 
 
 # ---------- STEP 3: PUT IT ALL TOGETHER ----------
 def main():
     print("=" * 50)
-    print("  STOCK NEWS BRIEF - mini terminal v0.1")
+    print("  STOCK NEWS BRIEF - mini terminal v0.2")
     print("=" * 50)
 
     ticker = input("\nEnter a ticker symbol (e.g. AAPL): ").strip().upper()
@@ -110,17 +110,22 @@ def main():
 
     if len(news) == 0:
         print("No news found. Check the ticker symbol and try again.")
-        return   # stop here
+        return
 
     print(f"Found {len(news)} stories. Asking Claude to summarize...\n")
     brief = summarize(ticker, news)
 
     print("-" * 50)
-    print(brief)
+    print(f"SENTIMENT: {brief['sentiment_label']} ({brief['sentiment_score']}/10)")
+    print()
+    print(f"SUMMARY: {brief['summary']}")
+    print()
+    print(f"TOP RISK: {brief['top_risk']}")
+    if brief["rumor_flag"]:
+        print()
+        print("⚠️  WARNING: at least one story is single-source or unconfirmed")
     print("-" * 50)
 
 
-# This line means: "only run main() if this file is run directly"
-# (a standard Python convention - you'll see it everywhere).
 if __name__ == "__main__":
     main()
