@@ -1,11 +1,11 @@
 """
-STOCK NEWS BRIEF - your mini Bloomberg terminal (v0.2)
+STOCK NEWS BRIEF - your mini Bloomberg terminal (v0.3)
 ------------------------------------------------------
 What this does:
-  1. Asks you for a stock ticker (like AAPL or TSLA)
-  2. Fetches recent news headlines about that company from Finnhub
+  1. Asks you for one or more stock tickers (like AAPL, TSLA)
+  2. Fetches recent news headlines for each from Finnhub
   3. Sends them to Claude, which returns structured JSON (sentiment score etc.)
-  4. Prints a formatted brief in your terminal
+  4. Prints a formatted brief per ticker + a sentiment leaderboard
 
 How to run it:
   python3 stock_brief.py
@@ -57,15 +57,12 @@ def summarize(ticker, news_items):
     Sends the headlines to Claude and gets back structured data:
     a dictionary with sentiment_score, summary, top_risk, etc.
     """
-    # Build one big text block out of all the headlines + summaries.
     headlines_text = ""
     for item in news_items:
         headlines_text += f"- HEADLINE: {item['headline']}\n"
         headlines_text += f"  SOURCE: {item['source']}\n"
         headlines_text += f"  SUMMARY: {item['summary']}\n\n"
 
-    # The prompt now demands JSON. The doubled {{ }} are how you write a
-    # literal curly brace inside an f-string.
     prompt = f"""You are a financial news analyst. Below are recent news items
 about the stock {ticker}.
 
@@ -94,27 +91,14 @@ Be factual. Do not give buy/sell advice."""
     # Sometimes the model wraps JSON in ```json fences - strip them if present.
     raw = raw.replace("```json", "").replace("```", "").strip()
 
-    return json.loads(raw)   # convert the JSON text into a Python dictionary
+    return json.loads(raw)
 
 
-# ---------- STEP 3: PUT IT ALL TOGETHER ----------
-def main():
-    print("=" * 50)
-    print("  STOCK NEWS BRIEF - mini terminal v0.2")
-    print("=" * 50)
-
-    ticker = input("\nEnter a ticker symbol (e.g. AAPL): ").strip().upper()
-
-    print(f"\nFetching news for {ticker}...")
-    news = get_news(ticker)
-
-    if len(news) == 0:
-        print("No news found. Check the ticker symbol and try again.")
-        return
-
-    print(f"Found {len(news)} stories. Asking Claude to summarize...\n")
-    brief = summarize(ticker, news)
-
+# ---------- STEP 3: PRINT ONE TICKER'S BRIEF ----------
+def print_brief(ticker, brief):
+    """Nicely formats a single ticker's brief in the terminal."""
+    print("-" * 50)
+    print(f"  {ticker}")
     print("-" * 50)
     print(f"SENTIMENT: {brief['sentiment_label']} ({brief['sentiment_score']}/10)")
     print()
@@ -124,7 +108,43 @@ def main():
     if brief["rumor_flag"]:
         print()
         print("⚠️  WARNING: at least one story is single-source or unconfirmed")
-    print("-" * 50)
+    print()
+
+
+# ---------- STEP 4: PUT IT ALL TOGETHER ----------
+def main():
+    print("=" * 50)
+    print("  STOCK NEWS BRIEF - mini terminal v0.3")
+    print("=" * 50)
+
+    raw_input_text = input("\nEnter ticker(s), comma-separated (e.g. AAPL, TSLA): ")
+    # Split on commas, clean up spaces, uppercase everything -> a list of tickers
+    tickers = [t.strip().upper() for t in raw_input_text.split(",")]
+
+    results = {}   # will map ticker -> its brief
+
+    for ticker in tickers:
+        print(f"\nFetching news for {ticker}...")
+        news = get_news(ticker)
+
+        if len(news) == 0:
+            print(f"No news found for {ticker} - skipping.")
+            continue   # move on to the next ticker
+
+        print(f"Found {len(news)} stories. Asking Claude to summarize...\n")
+        brief = summarize(ticker, news)
+        results[ticker] = brief
+
+        print_brief(ticker, brief)
+
+    # ----- comparison leaderboard (only if we did more than one ticker) -----
+    if len(results) > 1:
+        print("=" * 50)
+        print("  SENTIMENT LEADERBOARD")
+        print("=" * 50)
+        ranked = sorted(results.items(), key=lambda x: x[1]["sentiment_score"], reverse=True)
+        for ticker, brief in ranked:
+            print(f"  {ticker}: {brief['sentiment_score']}/10  ({brief['sentiment_label']})")
 
 
 if __name__ == "__main__":
