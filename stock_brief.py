@@ -1,21 +1,21 @@
 """
-STOCK NEWS BRIEF - your mini Bloomberg terminal (v0.3)
-------------------------------------------------------
-What this does:
-  1. Asks you for one or more stock tickers (like AAPL, TSLA)
-  2. Fetches recent news headlines for each from Finnhub
-  3. Sends them to Claude, which returns structured JSON (sentiment score etc.)
-  4. Prints a formatted brief per ticker + a sentiment leaderboard
+STOCK NEWS BRIEF - engine (v0.6.1)
+----------------------------------
+News fetching (company + macro), AI summarization, price data, CSV logging.
+v0.6.1: fetch RSS feeds with a browser user-agent (some sites block scripts).
 
-How to run it:
+How to run the terminal version:
   python3 stock_brief.py
 """
 
 # ---------- IMPORTS ----------
 import os                      # read environment variables (where we hide API keys)
+import csv                     # read/write CSV files (our sentiment history log)
 import json                    # convert JSON text <-> Python dictionaries
 import requests                # make requests to APIs over the internet
-from datetime import date, timedelta   # work with dates (news from the last week)
+import feedparser              # parse RSS feed content from news sites
+import yfinance as yf          # historical price data from Yahoo Finance
+from datetime import date, timedelta   # work with dates
 from dotenv import load_dotenv          # load our secret keys from the .env file
 from anthropic import Anthropic         # the official Claude library
 
@@ -25,8 +25,24 @@ load_dotenv()
 FINNHUB_KEY = os.getenv("FINNHUB_API_KEY")
 claude = Anthropic()  # automatically finds ANTHROPIC_API_KEY in .env
 
+# RSS feeds for macro/market-wide news.
+MACRO_FEEDS = {
+    "CNBC Economy": "https://www.cnbc.com/id/20910258/device/rss/rss.html",
+    "CNBC Top News": "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    "MarketWatch": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+    "Yahoo Finance": "https://finance.yahoo.com/news/rssindex",
+}
 
-# ---------- STEP 1: GET NEWS HEADLINES ----------
+# Some news sites block requests that identify as scripts. This header makes
+# our requests identify as a normal browser instead.
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/126.0.0.0 Safari/537.36"
+}
+
+
+# ---------- COMPANY NEWS (Finnhub) ----------
 def get_news(ticker):
     """
     Asks Finnhub for company news from the last 7 days.
@@ -45,16 +61,107 @@ def get_news(ticker):
     }
 
     response = requests.get(url, params=params)
-    response.raise_for_status()   # stop with an error if something went wrong
+    response.raise_for_status()
 
     news_items = response.json()
-    return news_items[:10]        # keep only the first 10 stories
+    return news_items[:10]
 
 
-# ---------- STEP 2: SUMMARIZE WITH CLAUDE (structured JSON output) ----------
+# ---------- MACRO NEWS (multi-source RSS) ----------
+def get_macro_news():
+    """
+    Pulls recent headlines from several major outlets' RSS feeds.
+    Fetches with a browser user-agent (some sites block scripts), then
+    parses the feed content with feedparser.
+    Returns a list of dictionaries: {"source": ..., "title": ..., "summary": ...}
+    """
+    stories = []
+    for source_name, feed_url in MACRO_FEEDS.items():
+        try:
+            # Step 1: download the feed ourselves, disguised as a browser.
+            response = requests.get(feed_url, headers=BROWSER_HEADERS, timeout=10)
+            response.raise_for_status()
+
+            # Step 2: hand the downloaded content to feedparser to interpret.
+            feed = feedparser.parse(response.content)
+
+            for entry in feed.entries[:5]:
+                stories.append({
+                    "source": source_name,
+                    "title": entry.get("title", ""),
+                    "summary": entry.get("summary", "")[:300],
+                })
+        except Exception:
+            # If one feed is down or blocked, skip it - don't crash everything.
+            continue
+    return stories
+
+
+def summarize_macro(stories):
+    """
+    Sends macro headlines from multiple sources to Claude and gets back
+    a structured big-picture market briefing.
+    """
+    headlines_text = ""
+    for s in stories:
+        headlines_text += f"- [{s['source']}] {s['title']}\n"
+        if s["summary"]:
+            headlines_text += f"  {s['summary']}\n"
+        headlines_text += "\n"
+
+    prompt = f"""You are a macro market analyst. Below are current headlines from
+several major financial news outlets.
+
+{headlines_text}
+
+Respond with ONLY a JSON object, no other text before or after, in exactly
+this format:
+{{
+  "market_mood": "<Risk-on, Risk-off, or Mixed>",
+  "big_picture": "<3-4 sentences: the most important macro themes right now
+  (central banks, policy, geopolitics, major economic data)>",
+  "key_events": ["<short bullet>", "<short bullet>", "<short bullet>"],
+  "watch_next": "<1 sentence: the upcoming event or decision markets care about most>"
+}}
+
+Focus on market-wide forces (rates, policy, conflicts, economic data), NOT
+individual company stories. Be factual. Do not give buy/sell advice."""
+
+    message = claude.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=600,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    raw = message.content[0].text
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+
+# ---------- PRICE HISTORY ----------
+def get_prices(ticker):
+    """
+    Gets the last month of daily closing prices from Yahoo Finance.
+    Returns (closing prices table, week % change), or (None, None) if unavailable.
+    """
+    stock = yf.Ticker(ticker)
+    history = stock.history(period="1mo")
+
+    if history.empty:
+        return None, None
+
+    closes = history["Close"]
+    week_ago_price = closes.iloc[-6] if len(closes) >= 6 else closes.iloc[0]
+    latest_price = closes.iloc[-1]
+    pct_change = (latest_price - week_ago_price) / week_ago_price * 100
+
+    return closes, pct_change
+
+
+# ---------- COMPANY SUMMARIZATION (structured JSON) ----------
 def summarize(ticker, news_items):
     """
-    Sends the headlines to Claude and gets back structured data:
+    Sends company headlines to Claude and gets back structured data:
     a dictionary with sentiment_score, summary, top_risk, etc.
     """
     headlines_text = ""
@@ -78,7 +185,8 @@ this format:
   "rumor_flag": <true if any major story is single-source or unconfirmed, else false>
 }}
 
-Be factual. Do not give buy/sell advice."""
+Focus on COMPANY-SPECIFIC news (products, earnings, legal, management), not
+general market conditions. Be factual. Do not give buy/sell advice."""
 
     message = claude.messages.create(
         model="claude-sonnet-4-6",
@@ -87,14 +195,11 @@ Be factual. Do not give buy/sell advice."""
     )
 
     raw = message.content[0].text
-
-    # Sometimes the model wraps JSON in ```json fences - strip them if present.
     raw = raw.replace("```json", "").replace("```", "").strip()
-
     return json.loads(raw)
 
 
-# ---------- STEP 3: PRINT ONE TICKER'S BRIEF ----------
+# ---------- PRINT ONE TICKER'S BRIEF (terminal version) ----------
 def print_brief(ticker, brief):
     """Nicely formats a single ticker's brief in the terminal."""
     print("-" * 50)
@@ -111,17 +216,38 @@ def print_brief(ticker, brief):
     print()
 
 
-# ---------- STEP 4: PUT IT ALL TOGETHER ----------
+# ---------- LOG RESULTS TO CSV ----------
+def log_to_csv(ticker, brief):
+    """
+    Appends one row (date, ticker, score, label, rumor_flag) to sentiment_log.csv.
+    Creates the file with a header row if it doesn't exist yet.
+    """
+    filename = "sentiment_log.csv"
+    file_exists = os.path.exists(filename)
+
+    with open(filename, "a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["date", "ticker", "sentiment_score", "sentiment_label", "rumor_flag"])
+        writer.writerow([
+            date.today().strftime("%Y-%m-%d"),
+            ticker,
+            brief["sentiment_score"],
+            brief["sentiment_label"],
+            brief["rumor_flag"],
+        ])
+
+
+# ---------- TERMINAL VERSION ----------
 def main():
     print("=" * 50)
-    print("  STOCK NEWS BRIEF - mini terminal v0.3")
+    print("  STOCK NEWS BRIEF - mini terminal v0.6.1")
     print("=" * 50)
 
     raw_input_text = input("\nEnter ticker(s), comma-separated (e.g. AAPL, TSLA): ")
-    # Split on commas, clean up spaces, uppercase everything -> a list of tickers
     tickers = [t.strip().upper() for t in raw_input_text.split(",")]
 
-    results = {}   # will map ticker -> its brief
+    results = {}
 
     for ticker in tickers:
         print(f"\nFetching news for {ticker}...")
@@ -129,15 +255,15 @@ def main():
 
         if len(news) == 0:
             print(f"No news found for {ticker} - skipping.")
-            continue   # move on to the next ticker
+            continue
 
         print(f"Found {len(news)} stories. Asking Claude to summarize...\n")
         brief = summarize(ticker, news)
         results[ticker] = brief
 
         print_brief(ticker, brief)
+        log_to_csv(ticker, brief)
 
-    # ----- comparison leaderboard (only if we did more than one ticker) -----
     if len(results) > 1:
         print("=" * 50)
         print("  SENTIMENT LEADERBOARD")
