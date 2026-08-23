@@ -1,7 +1,9 @@
 """
-STOCK NEWS BRIEF - engine (v0.6.1)
-----------------------------------
+STOCK NEWS BRIEF - engine (v0.7)
+--------------------------------
 News fetching (company + macro), AI summarization, price data, CSV logging.
+v0.7:    upgrade to Claude Opus 5 and use structured outputs, so the API
+         guarantees the reply shape instead of us parsing it by hand.
 v0.6.1: fetch RSS feeds with a browser user-agent (some sites block scripts).
 
 How to run the terminal version:
@@ -11,12 +13,13 @@ How to run the terminal version:
 # ---------- IMPORTS ----------
 import os                      # read environment variables (where we hide API keys)
 import csv                     # read/write CSV files (our sentiment history log)
-import json                    # convert JSON text <-> Python dictionaries
 import requests                # make requests to APIs over the internet
 import feedparser              # parse RSS feed content from news sites
 import yfinance as yf          # historical price data from Yahoo Finance
+from typing import Literal              # restrict a field to a fixed set of values
 from datetime import date, timedelta   # work with dates
 from dotenv import load_dotenv          # load our secret keys from the .env file
+from pydantic import BaseModel, Field   # describe the exact shape we want back
 from anthropic import Anthropic         # the official Claude library
 
 # ---------- SETUP ----------
@@ -40,6 +43,31 @@ BROWSER_HEADERS = {
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
                   "Chrome/126.0.0.0 Safari/537.36"
 }
+
+MODEL = "claude-opus-5"
+
+
+# ---------- RESPONSE SHAPES ----------
+# These classes describe the exact structure we want back from Claude. We hand
+# them to the API, which then *guarantees* the reply matches - no more asking
+# nicely in the prompt and hoping, and no more stripping stray text by hand.
+class CompanyBrief(BaseModel):
+    """Claude's analysis of one company's recent news."""
+    sentiment_score: int = Field(ge=1, le=10,
+                                 description="1 = very negative, 10 = very positive")
+    sentiment_label: Literal["Positive", "Negative", "Mixed"]
+    summary: str = Field(description="3-4 sentence summary of the most important developments")
+    top_risk: str = Field(description="The single biggest risk or concern in this news")
+    rumor_flag: bool = Field(description="True if any major story is single-source or unconfirmed")
+
+
+class MacroBrief(BaseModel):
+    """Claude's read on the market-wide picture."""
+    market_mood: Literal["Risk-on", "Risk-off", "Mixed"]
+    big_picture: str = Field(description="3-4 sentences on the most important macro themes "
+                                         "right now (central banks, policy, geopolitics, data)")
+    key_events: list[str] = Field(description="Three short bullets on what is driving markets")
+    watch_next: str = Field(description="One sentence: the upcoming event markets care about most")
 
 
 # ---------- COMPANY NEWS (Finnhub) ----------
@@ -114,28 +142,19 @@ several major financial news outlets.
 
 {headlines_text}
 
-Respond with ONLY a JSON object, no other text before or after, in exactly
-this format:
-{{
-  "market_mood": "<Risk-on, Risk-off, or Mixed>",
-  "big_picture": "<3-4 sentences: the most important macro themes right now
-  (central banks, policy, geopolitics, major economic data)>",
-  "key_events": ["<short bullet>", "<short bullet>", "<short bullet>"],
-  "watch_next": "<1 sentence: the upcoming event or decision markets care about most>"
-}}
-
 Focus on market-wide forces (rates, policy, conflicts, economic data), NOT
 individual company stories. Be factual. Do not give buy/sell advice."""
 
-    message = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=600,
+    message = claude.messages.parse(
+        model=MODEL,
+        max_tokens=4000,
         messages=[{"role": "user", "content": prompt}],
+        output_format=MacroBrief,   # the API now guarantees this exact shape
     )
 
-    raw = message.content[0].text
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+    # .parsed_output is a validated MacroBrief. Hand back a plain dictionary so
+    # the rest of the app keeps working with macro["market_mood"] etc.
+    return message.parsed_output.model_dump()
 
 
 # ---------- PRICE HISTORY ----------
@@ -175,28 +194,19 @@ about the stock {ticker}.
 
 {headlines_text}
 
-Respond with ONLY a JSON object, no other text before or after, in exactly
-this format:
-{{
-  "sentiment_score": <integer 1-10, where 1=very negative, 10=very positive>,
-  "sentiment_label": "<Positive, Negative, or Mixed>",
-  "summary": "<3-4 sentence summary of the most important developments>",
-  "top_risk": "<the single biggest risk or concern in this news>",
-  "rumor_flag": <true if any major story is single-source or unconfirmed, else false>
-}}
-
 Focus on COMPANY-SPECIFIC news (products, earnings, legal, management), not
 general market conditions. Be factual. Do not give buy/sell advice."""
 
-    message = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=500,
+    message = claude.messages.parse(
+        model=MODEL,
+        max_tokens=4000,
         messages=[{"role": "user", "content": prompt}],
+        output_format=CompanyBrief,   # the API now guarantees this exact shape
     )
 
-    raw = message.content[0].text
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+    # .parsed_output is a validated CompanyBrief. Hand back a plain dictionary so
+    # the rest of the app keeps working with brief["sentiment_score"] etc.
+    return message.parsed_output.model_dump()
 
 
 # ---------- PRINT ONE TICKER'S BRIEF (terminal version) ----------
