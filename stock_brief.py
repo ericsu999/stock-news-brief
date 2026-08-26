@@ -1,7 +1,10 @@
 """
-STOCK NEWS BRIEF - engine (v0.7)
+STOCK NEWS BRIEF - engine (v0.8)
 --------------------------------
 News fetching (company + macro), AI summarization, price data, CSV logging.
+v0.8:    read the sentiment log back, so each brief shows how sentiment moved
+         since last time; flag when sentiment and price disagree; and log one
+         row per ticker per day instead of one per run.
 v0.7:    upgrade to Claude Opus 5 and use structured outputs, so the API
          guarantees the reply shape instead of us parsing it by hand.
 v0.6.1: fetch RSS feeds with a browser user-agent (some sites block scripts).
@@ -45,6 +48,21 @@ BROWSER_HEADERS = {
 }
 
 MODEL = "claude-opus-5"
+
+# Where the sentiment history lives. We anchor it to this file's own folder so
+# the log always lands in the project, no matter which directory you happen to
+# run the app from.
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sentiment_log.csv")
+LOG_FIELDS = ["date", "ticker", "sentiment_score", "sentiment_label", "rumor_flag"]
+
+# ---------- DIVERGENCE THRESHOLDS ----------
+# The interesting case is when the news mood and the share price disagree:
+# upbeat coverage while the stock falls, or gloomy coverage while it rises.
+# That mismatch is easy to miss when you're only skimming headlines. These
+# numbers decide what counts as "disagreeing".
+BULLISH_SCORE = 7      # at or above this, coverage reads positive
+BEARISH_SCORE = 4      # at or below this, coverage reads negative
+PRICE_MOVE_PCT = 3.0   # a weekly move smaller than this is just noise
 
 
 # ---------- RESPONSE SHAPES ----------
@@ -210,13 +228,31 @@ general market conditions. Be factual. Do not give buy/sell advice."""
 
 
 # ---------- PRINT ONE TICKER'S BRIEF (terminal version) ----------
-def print_brief(ticker, brief):
-    """Nicely formats a single ticker's brief in the terminal."""
+def print_brief(ticker, brief, change=None, divergence=None):
+    """
+    Nicely formats a single ticker's brief in the terminal.
+
+    `change` and `divergence` are optional - when we have them, we show how
+    sentiment moved since last time and whether it disagrees with the price.
+    """
     print("-" * 50)
     print(f"  {ticker}")
     print("-" * 50)
-    print(f"SENTIMENT: {brief['sentiment_label']} ({brief['sentiment_score']}/10)")
+
+    # Sentiment, plus how it moved since the last time we scored this ticker.
+    line = f"SENTIMENT: {brief['sentiment_label']} ({brief['sentiment_score']}/10)"
+    if change:
+        arrow = {"up": "▲", "down": "▼", "flat": "="}[change["direction"]]
+        line += (f"  {arrow} from {change['previous_score']}/10"
+                 f" on {change['previous_date']}")
+    print(line)
     print()
+
+    if divergence:
+        print(f"⚡ DIVERGENCE - {divergence['headline']}")
+        print(f"   {divergence['detail']}")
+        print()
+
     print(f"SUMMARY: {brief['summary']}")
     print()
     print(f"TOP RISK: {brief['top_risk']}")
@@ -226,32 +262,125 @@ def print_brief(ticker, brief):
     print()
 
 
+# ---------- READ THE LOG BACK ----------
+def read_log():
+    """
+    Reads the whole sentiment history back as a list of dictionaries.
+    Returns an empty list if we've never logged anything yet.
+
+    Everything in a CSV file is text, so we convert the score back to a number
+    and rumor_flag back to a real True/False on the way out.
+    """
+    if not os.path.exists(LOG_PATH):
+        return []
+
+    rows = []
+    with open(LOG_PATH, newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                row["sentiment_score"] = int(row["sentiment_score"])
+            except (TypeError, ValueError, KeyError):
+                continue    # skip a malformed line rather than crashing
+            row["rumor_flag"] = str(row.get("rumor_flag", "")).strip().lower() == "true"
+            rows.append(row)
+    return rows
+
+
+def get_history(ticker):
+    """
+    Every past score for one ticker, oldest first, ignoring today's run.
+    This is what lets the app say "up from 6 last week" instead of just "8".
+    """
+    today = date.today().strftime("%Y-%m-%d")
+    past = [r for r in read_log() if r["ticker"] == ticker and r["date"] < today]
+    return sorted(past, key=lambda r: r["date"])
+
+
+def get_sentiment_change(ticker, current_score):
+    """
+    Compares today's score against the most recent earlier one.
+    Returns a dictionary describing the move, or None if this is the first
+    time we've ever scored this ticker.
+    """
+    history = get_history(ticker)
+    if not history:
+        return None
+
+    previous = history[-1]
+    delta = current_score - previous["sentiment_score"]
+
+    return {
+        "previous_score": previous["sentiment_score"],
+        "previous_date": previous["date"],
+        "delta": delta,
+        "direction": "up" if delta > 0 else "down" if delta < 0 else "flat",
+    }
+
+
+# ---------- SENTIMENT vs PRICE DIVERGENCE ----------
+def get_divergence(sentiment_score, pct_change):
+    """
+    Checks whether the news mood and the 1-week price move point opposite ways.
+    Returns a dictionary describing the mismatch, or None when the two agree
+    (or when the price move is too small to read anything into).
+    """
+    if pct_change is None:
+        return None
+
+    if sentiment_score >= BULLISH_SCORE and pct_change <= -PRICE_MOVE_PCT:
+        return {
+            "type": "sentiment_ahead",
+            "headline": "Positive coverage, falling price",
+            "detail": (f"The news reads positive ({sentiment_score}/10) but the stock is "
+                       f"{pct_change:+.1f}% this week. The market isn't buying the story, "
+                       f"or it's reacting to something the headlines haven't caught yet."),
+        }
+
+    if sentiment_score <= BEARISH_SCORE and pct_change >= PRICE_MOVE_PCT:
+        return {
+            "type": "price_ahead",
+            "headline": "Negative coverage, rising price",
+            "detail": (f"The news reads negative ({sentiment_score}/10) but the stock is "
+                       f"{pct_change:+.1f}% this week. The bad news may already be priced "
+                       f"in, or buyers are looking past it."),
+        }
+
+    return None
+
+
 # ---------- LOG RESULTS TO CSV ----------
 def log_to_csv(ticker, brief):
     """
-    Appends one row (date, ticker, score, label, rumor_flag) to sentiment_log.csv.
-    Creates the file with a header row if it doesn't exist yet.
-    """
-    filename = "sentiment_log.csv"
-    file_exists = os.path.exists(filename)
+    Records today's score for this ticker - one row per ticker per day.
 
-    with open(filename, "a", newline="") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(["date", "ticker", "sentiment_score", "sentiment_label", "rumor_flag"])
-        writer.writerow([
-            date.today().strftime("%Y-%m-%d"),
-            ticker,
-            brief["sentiment_score"],
-            brief["sentiment_label"],
-            brief["rumor_flag"],
-        ])
+    Running the app twice in one day now updates that day's row instead of
+    adding a duplicate, so the history stays a clean one-point-per-day series
+    that we can actually chart.
+    """
+    today = date.today().strftime("%Y-%m-%d")
+
+    # Keep every existing row except an earlier run of this ticker today.
+    kept = [r for r in read_log()
+            if not (r["date"] == today and r["ticker"] == ticker)]
+
+    kept.append({
+        "date": today,
+        "ticker": ticker,
+        "sentiment_score": brief["sentiment_score"],
+        "sentiment_label": brief["sentiment_label"],
+        "rumor_flag": brief["rumor_flag"],
+    })
+
+    with open(LOG_PATH, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=LOG_FIELDS)
+        writer.writeheader()
+        writer.writerows(kept)
 
 
 # ---------- TERMINAL VERSION ----------
 def main():
     print("=" * 50)
-    print("  STOCK NEWS BRIEF - mini terminal v0.6.1")
+    print("  STOCK NEWS BRIEF - mini terminal v0.8")
     print("=" * 50)
 
     raw_input_text = input("\nEnter ticker(s), comma-separated (e.g. AAPL, TSLA): ")
@@ -271,7 +400,14 @@ def main():
         brief = summarize(ticker, news)
         results[ticker] = brief
 
-        print_brief(ticker, brief)
+        # Compare against history and against the price BEFORE logging today's
+        # run, so we're reading yesterday's number rather than the one we just
+        # wrote.
+        change = get_sentiment_change(ticker, brief["sentiment_score"])
+        _, pct_change = get_prices(ticker)
+        divergence = get_divergence(brief["sentiment_score"], pct_change)
+
+        print_brief(ticker, brief, change=change, divergence=divergence)
         log_to_csv(ticker, brief)
 
     if len(results) > 1:

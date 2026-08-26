@@ -1,17 +1,23 @@
 """
-STOCK NEWS BRIEF - web dashboard (v1.2)
+STOCK NEWS BRIEF - web dashboard (v1.3)
 ---------------------------------------
 Macro briefing panel (multi-source RSS) + per-ticker company briefs.
+v1.3: show how sentiment moved since last time, chart the history we've been
+      logging all along, and call out when sentiment and price disagree.
 
 How to run it:
   streamlit run app.py
 """
 
+from datetime import date
+
+import pandas as pd
 import streamlit as st
 
 from stock_brief import (
     get_news, summarize, log_to_csv, get_prices,
     get_macro_news, summarize_macro,
+    get_history, get_sentiment_change, get_divergence,
 )
 
 # ---------- PAGE SETUP ----------
@@ -91,8 +97,23 @@ if run:
                 brief = summarize(ticker, news)
                 closes, pct_change = get_prices(ticker)
 
+                # Read the history and compare BEFORE logging today's run, so
+                # we're looking at the previous score rather than the one we're
+                # about to write.
+                change = get_sentiment_change(ticker, brief["sentiment_score"])
+                history = get_history(ticker)
+                divergence = get_divergence(brief["sentiment_score"], pct_change)
+
                 results[ticker] = brief
-                data[ticker] = (news, brief, closes, pct_change)
+                data[ticker] = {
+                    "news": news,
+                    "brief": brief,
+                    "closes": closes,
+                    "pct_change": pct_change,
+                    "change": change,
+                    "history": history,
+                    "divergence": divergence,
+                }
                 log_to_csv(ticker, brief)
 
             except Exception as e:
@@ -105,18 +126,56 @@ if run:
             tabs = st.tabs(list(data.keys()))
 
             for tab, ticker in zip(tabs, data.keys()):
-                news, brief, closes, pct_change = data[ticker]
+                d = data[ticker]
+                news, brief = d["news"], d["brief"]
                 with tab:
                     col1, col2, col3, col4 = st.columns(4)
                     color = sentiment_color(brief["sentiment_score"])
-                    col1.metric("Sentiment", f"{brief['sentiment_score']}/10")
+
+                    # The metric's little arrow is exactly the move since our
+                    # last run, so the change shows up right on the number.
+                    if d["change"]:
+                        delta_text = (f"{d['change']['delta']:+d} since "
+                                      f"{d['change']['previous_date']}")
+                        # A flat score shouldn't get a green "up" arrow.
+                        delta_color = "off" if d["change"]["delta"] == 0 else "normal"
+                    else:
+                        delta_text, delta_color = None, "normal"
+
+                    col1.metric("Sentiment", f"{brief['sentiment_score']}/10",
+                                delta=delta_text, delta_color=delta_color)
                     col2.metric("Tone", brief["sentiment_label"])
-                    if pct_change is not None:
-                        col3.metric("1-week price", f"{pct_change:+.1f}%")
+                    if d["pct_change"] is not None:
+                        col3.metric("1-week price", f"{d['pct_change']:+.1f}%")
                     col4.metric("Stories analyzed", len(news))
 
-                    if closes is not None:
-                        st.line_chart(closes, height=250)
+                    # When the news mood and the price disagree, say so loudly -
+                    # that mismatch is the whole reason we track both.
+                    if d["divergence"]:
+                        st.warning(f"**⚡ {d['divergence']['headline']}** — "
+                                   f"{d['divergence']['detail']}")
+
+                    chart_cols = st.columns(2)
+
+                    if d["closes"] is not None:
+                        chart_cols[0].caption("Price — last month")
+                        chart_cols[0].line_chart(d["closes"], height=250)
+
+                    # The sentiment history we've been logging all along but
+                    # never showed. Today's fresh score goes on the end.
+                    if d["history"]:
+                        series = pd.DataFrame(
+                            [{"date": r["date"], "sentiment": r["sentiment_score"]}
+                             for r in d["history"]]
+                            + [{"date": date.today().strftime("%Y-%m-%d"),
+                                "sentiment": brief["sentiment_score"]}]
+                        ).set_index("date")
+                        chart_cols[1].caption("Sentiment — every day we've logged")
+                        chart_cols[1].line_chart(series, height=250)
+                    else:
+                        chart_cols[1].caption("Sentiment — every day we've logged")
+                        chart_cols[1].info("First time scoring this ticker. Run it "
+                                           "again tomorrow to start a trend.")
 
                     st.markdown(f"### :{color}[{brief['sentiment_label']} sentiment]")
                     st.markdown(f"**Summary:** {brief['summary']}")
